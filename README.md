@@ -1,6 +1,6 @@
 # Google Apps Scriptによるスプレッドシート更新通知ツール
 
-Googleスプレッドシートに新しい行が追加されたとき、Discord Webhook と Gmail へ自動通知するポートフォリオ用ツールです。問い合わせ・注文管理・在庫確認など、スプレッドシートを毎回開いて確認する手間を減らす目的で制作しました。
+Googleスプレッドシートに新しい行が追加されたとき、Discord Webhook と Gmail へ自動通知するツールです。問い合わせ・注文管理・在庫確認など、スプレッドシートを毎回開いて確認する手間を減らす目的で制作しました。
 
 ## English Summary
 
@@ -92,26 +92,6 @@ Apps Script エディタで `installTimeDrivenTrigger()` を1回実行すると�
 5. `EMAIL_TO` を空にして Discord だけ届くことを確認します。
 6. `名前` または `内容` が空の行を追加し、通知されないことを確認します。
 7. Discord または Gmail の片方を一時的に失敗させ、復旧後に未送信の宛先だけ再試行されることを確認します。
-
-## Portfolio Notes
-
-タイトル例:
-
-```text
-Google Apps Scriptによるスプレッドシート更新通知ツール
-```
-
-説明文例:
-
-```text
-スプレッドシートに新しい行が追加された際、DiscordとGmailへ自動通知するツールです。問い合わせ・注文管理・在庫確認など、手動確認の手間を減らす目的で制作しました。
-```
-
-GitHubには次の内容を載せると伝わりやすくなります。
-
-- `README.md`
-- `src/Code.gs`
-- `samples/sample-sheet.csv`
 
 ## License
 
