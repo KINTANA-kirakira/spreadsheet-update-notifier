@@ -41,6 +41,13 @@ spreadsheet-update-notifier/
 
 サンプルデータは `samples/sample-sheet.csv` にあります。
 
+## Operational Notes
+
+- This tool is designed for append-only sheets, such as form responses or rows added by an import process.
+- Reordering rows, inserting rows in the middle, deleting rows, or editing rows that are waiting for notification can make the saved row number state differ from the actual data.
+- Rows with an empty `名前` or `内容` value are treated as processed and skipped. If those cells are filled in later, the row will not be notified.
+- For workflows that require row edits after creation, consider adding a unique ID column and tracking notification state by ID instead of row number.
+
 ## Setup
 
 1. Googleスプレッドシートを作成し、シート名を `Responses` にします。
