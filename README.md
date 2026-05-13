@@ -14,6 +14,8 @@ A Google Apps Script tool that checks a Google Spreadsheet on a time-driven trig
 - Discord と Gmail の両方に対応
 - 初回実行時は既存行を大量通知せず、現在の最終行から監視開始
 - `PropertiesService` で最後に通知した行番号を保存
+- 宛先ごとの送信状態を保存し、部分失敗時は未送信の宛先だけ再試行
+- `LockService` で同時実行による二重通知を抑制
 
 ## Files
 
@@ -31,7 +33,7 @@ spreadsheet-update-notifier/
 
 ## Spreadsheet Format
 
-シート名のデフォルトは `Responses` です。1行目に次の見出しを作成してください。
+シート名のデフォルトは `Responses` です。1行目に次の見出しを作成してください。このツールは追記専用のシートを想定しているため、通知済み行の並べ替えや途中への行挿入は避けてください。
 
 | 日時 | 名前 | 内容 |
 | --- | --- | --- |
@@ -73,12 +75,13 @@ Apps Script エディタで `installTimeDrivenTrigger()` を1回実行すると�
 
 ## How It Works
 
-1. `checkNewRows()` が対象シートの最終行を取得します。
+1. `checkNewRows()` が `LockService` のロックを取得し、対象シートの最終行を取得します。
 2. `ScriptProperties` の `LAST_NOTIFIED_ROW` と比較します。
 3. 初回実行時は既存行を通知せず、現在の最終行を保存します。
 4. 2回目以降は `LAST_NOTIFIED_ROW` より下の行だけを読み取ります。
-5. `名前` または `内容` が空の行は通知対象外にします。
-6. Discord / Gmail への通知が成功した行まで `LAST_NOTIFIED_ROW` を更新します。
+5. `名前` または `内容` が空の行は通知対象外として処理済みにします。
+6. Discord / Gmail のどちらかだけ失敗した場合は、成功済みの宛先を `PENDING_NOTIFICATION_STATE` に保存します。
+7. 次回実行時は未送信の宛先だけ再試行し、必要な通知が完了した行まで `LAST_NOTIFIED_ROW` を更新します。
 
 ## Verification
 
@@ -88,6 +91,7 @@ Apps Script エディタで `installTimeDrivenTrigger()` を1回実行すると�
 4. `DISCORD_WEBHOOK_URL` を空にして Gmail だけ届くことを確認します。
 5. `EMAIL_TO` を空にして Discord だけ届くことを確認します。
 6. `名前` または `内容` が空の行を追加し、通知されないことを確認します。
+7. Discord または Gmail の片方を一時的に失敗させ、復旧後に未送信の宛先だけ再試行されることを確認します。
 
 ## Portfolio Notes
 

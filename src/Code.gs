@@ -5,6 +5,7 @@ const PROPERTY_KEYS = {
   ENABLE_DISCORD: 'ENABLE_DISCORD',
   ENABLE_EMAIL: 'ENABLE_EMAIL',
   LAST_NOTIFIED_ROW: 'LAST_NOTIFIED_ROW',
+  PENDING_NOTIFICATION_STATE: 'PENDING_NOTIFICATION_STATE',
 };
 
 const DEFAULTS = {
@@ -25,6 +26,20 @@ const HEADER_ALIASES = {
  * Checks for rows added after LAST_NOTIFIED_ROW and sends notifications.
  */
 function checkNewRows() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) {
+    Logger.log('Another checkNewRows execution is already running.');
+    return;
+  }
+
+  try {
+    checkNewRowsWithLock_();
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function checkNewRowsWithLock_() {
   const props = PropertiesService.getScriptProperties();
   const config = getConfig_(props);
   const sheet = getTargetSheet_(config.sheetName);
@@ -32,6 +47,7 @@ function checkNewRows() {
 
   if (lastRow < 2) {
     props.setProperty(PROPERTY_KEYS.LAST_NOTIFIED_ROW, String(lastRow));
+    clearPendingDeliveryState_(props);
     Logger.log('No data rows found. LAST_NOTIFIED_ROW was set to %s.', lastRow);
     return;
   }
@@ -39,6 +55,7 @@ function checkNewRows() {
   const storedLastRow = props.getProperty(PROPERTY_KEYS.LAST_NOTIFIED_ROW);
   if (!storedLastRow) {
     props.setProperty(PROPERTY_KEYS.LAST_NOTIFIED_ROW, String(lastRow));
+    clearPendingDeliveryState_(props);
     Logger.log('First run detected. Existing rows were skipped up to row %s.', lastRow);
     return;
   }
@@ -50,6 +67,7 @@ function checkNewRows() {
 
   if (lastNotifiedRow > lastRow) {
     props.setProperty(PROPERTY_KEYS.LAST_NOTIFIED_ROW, String(lastRow));
+    clearPendingDeliveryState_(props);
     Logger.log('Sheet has fewer rows than saved state. LAST_NOTIFIED_ROW was reset to %s.', lastRow);
     return;
   }
@@ -64,7 +82,7 @@ function checkNewRows() {
   const columnMap = buildColumnMap_(headers);
   const rowCount = lastRow - lastNotifiedRow;
   const rows = sheet.getRange(lastNotifiedRow + 1, 1, rowCount, lastColumn).getValues();
-  let highestDeliveredRow = lastNotifiedRow;
+  let highestProcessedRow = lastNotifiedRow;
 
   for (let index = 0; index < rows.length; index += 1) {
     const rowNumber = lastNotifiedRow + index + 1;
@@ -72,25 +90,28 @@ function checkNewRows() {
 
     if (!isNotifiableEntry_(entry)) {
       Logger.log('Skipped row %s because name or content is empty.', rowNumber);
+      clearPendingDeliveryState_(props);
+      highestProcessedRow = rowNumber;
       continue;
     }
 
-    try {
-      const delivered = notifyEntry_(entry, config);
-      if (!delivered) {
-        Logger.log('Row %s was not delivered because no destination was available.', rowNumber);
-        break;
-      }
-      highestDeliveredRow = rowNumber;
-    } catch (error) {
-      Logger.log('Failed to notify row %s: %s', rowNumber, error.message);
+    const result = notifyEntry_(entry, config, props);
+    if (!result.hasDestination) {
+      Logger.log('Row %s was not delivered because no destination was available.', rowNumber);
       break;
     }
+
+    if (!result.complete) {
+      Logger.log('Row %s was partially delivered. Remaining destinations will be retried later.', rowNumber);
+      break;
+    }
+
+    highestProcessedRow = rowNumber;
   }
 
-  if (highestDeliveredRow > lastNotifiedRow) {
-    props.setProperty(PROPERTY_KEYS.LAST_NOTIFIED_ROW, String(highestDeliveredRow));
-    Logger.log('LAST_NOTIFIED_ROW was updated to %s.', highestDeliveredRow);
+  if (highestProcessedRow > lastNotifiedRow) {
+    props.setProperty(PROPERTY_KEYS.LAST_NOTIFIED_ROW, String(highestProcessedRow));
+    Logger.log('LAST_NOTIFIED_ROW was updated to %s.', highestProcessedRow);
   }
 }
 
@@ -117,7 +138,9 @@ function installTimeDrivenTrigger() {
  * The next checkNewRows run will initialize from the current last row.
  */
 function resetLastNotifiedRow() {
-  PropertiesService.getScriptProperties().deleteProperty(PROPERTY_KEYS.LAST_NOTIFIED_ROW);
+  const props = PropertiesService.getScriptProperties();
+  props.deleteProperty(PROPERTY_KEYS.LAST_NOTIFIED_ROW);
+  clearPendingDeliveryState_(props);
 }
 
 function getConfig_(props) {
@@ -190,18 +213,65 @@ function isNotifiableEntry_(entry) {
   return entry.name !== '' && entry.content !== '';
 }
 
-function notifyEntry_(entry, config) {
-  let sentCount = 0;
+function notifyEntry_(entry, config, props) {
+  const destinations = getActiveDestinations_(config);
+  if (destinations.length === 0) {
+    clearPendingDeliveryState_(props);
+    return {
+      hasDestination: false,
+      complete: false,
+    };
+  }
+
+  const state = readPendingDeliveryState_(props, entry.rowNumber);
   const failures = [];
+
+  for (let index = 0; index < destinations.length; index += 1) {
+    const destination = destinations[index];
+    if (state.delivered[destination.key]) {
+      continue;
+    }
+
+    try {
+      destination.send(entry);
+      state.delivered[destination.key] = true;
+      savePendingDeliveryState_(props, entry.rowNumber, state.delivered);
+    } catch (error) {
+      failures.push(destination.label + ': ' + error.message);
+    }
+  }
+
+  if (failures.length > 0) {
+    Logger.log('Notification failures for row %s: %s', entry.rowNumber, failures.join(' / '));
+  }
+
+  if (isDeliveryComplete_(destinations, state.delivered)) {
+    clearPendingDeliveryState_(props);
+    return {
+      hasDestination: true,
+      complete: true,
+    };
+  }
+
+  savePendingDeliveryState_(props, entry.rowNumber, state.delivered);
+  return {
+    hasDestination: true,
+    complete: false,
+  };
+}
+
+function getActiveDestinations_(config) {
+  const destinations = [];
 
   if (config.enableDiscord) {
     if (config.discordWebhookUrl) {
-      try {
-        sendDiscordNotification_(entry, config.discordWebhookUrl);
-        sentCount += 1;
-      } catch (error) {
-        failures.push('Discord: ' + error.message);
-      }
+      destinations.push({
+        key: 'discord',
+        label: 'Discord',
+        send: function (entry) {
+          sendDiscordNotification_(entry, config.discordWebhookUrl);
+        },
+      });
     } else {
       Logger.log('Discord notification is enabled but DISCORD_WEBHOOK_URL is empty.');
     }
@@ -209,22 +279,69 @@ function notifyEntry_(entry, config) {
 
   if (config.enableEmail) {
     if (config.emailTo) {
-      try {
-        sendEmailNotification_(entry, config.emailTo);
-        sentCount += 1;
-      } catch (error) {
-        failures.push('Email: ' + error.message);
-      }
+      destinations.push({
+        key: 'email',
+        label: 'Email',
+        send: function (entry) {
+          sendEmailNotification_(entry, config.emailTo);
+        },
+      });
     } else {
       Logger.log('Email notification is enabled but EMAIL_TO is empty.');
     }
   }
 
-  if (failures.length > 0) {
-    throw new Error(failures.join(' / '));
+  return destinations;
+}
+
+function readPendingDeliveryState_(props, rowNumber) {
+  const emptyState = {
+    delivered: {},
+  };
+  const rawState = props.getProperty(PROPERTY_KEYS.PENDING_NOTIFICATION_STATE);
+
+  if (!rawState) {
+    return emptyState;
   }
 
-  return sentCount > 0;
+  try {
+    const parsedState = JSON.parse(rawState);
+    if (parsedState.rowNumber !== rowNumber || !parsedState.delivered) {
+      return emptyState;
+    }
+
+    return {
+      delivered: parsedState.delivered,
+    };
+  } catch (error) {
+    Logger.log('Failed to parse pending delivery state: %s', error.message);
+    clearPendingDeliveryState_(props);
+    return emptyState;
+  }
+}
+
+function savePendingDeliveryState_(props, rowNumber, delivered) {
+  props.setProperty(
+    PROPERTY_KEYS.PENDING_NOTIFICATION_STATE,
+    JSON.stringify({
+      rowNumber: rowNumber,
+      delivered: delivered,
+    })
+  );
+}
+
+function clearPendingDeliveryState_(props) {
+  props.deleteProperty(PROPERTY_KEYS.PENDING_NOTIFICATION_STATE);
+}
+
+function isDeliveryComplete_(destinations, delivered) {
+  for (let index = 0; index < destinations.length; index += 1) {
+    if (!delivered[destinations[index].key]) {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 function sendDiscordNotification_(entry, webhookUrl) {
