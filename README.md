@@ -13,8 +13,9 @@ A Google Apps Script tool that checks a Google Spreadsheet on a time-driven trig
 - 通知文に `日時` / `名前` / `内容` を表示
 - Discord と Gmail の両方に対応
 - 初回実行時は既存行を大量通知せず、現在の最終行から監視開始
-- `PropertiesService` で最後に通知した行番号を保存
-- 宛先ごとの送信状態を保存し、部分失敗時は未送信の宛先だけ再試行
+- `通知ID` 列で行を識別し、並べ替えや途中挿入後も重複通知を防止
+- 宛先ごとの送信状態をシートに保存し、部分失敗時は未送信の宛先だけ再試行
+- 通知開始時の内容をスナップショット保存し、部分失敗後の再試行でも同じ内容を送信
 - `LockService` で同時実行による二重通知を抑制
 
 ## Files
@@ -33,7 +34,7 @@ spreadsheet-update-notifier/
 
 ## Spreadsheet Format
 
-シート名のデフォルトは `Responses` です。1行目に次の見出しを作成してください。このツールは追記専用のシートを想定しているため、通知済み行の並べ替えや途中への行挿入は避けてください。
+シート名のデフォルトは `Responses` です。1行目に次の見出しを作成してください。
 
 | 日時 | 名前 | 内容 |
 | --- | --- | --- |
@@ -43,10 +44,12 @@ spreadsheet-update-notifier/
 
 ## Operational Notes
 
-- This tool is designed for append-only sheets, such as form responses or rows added by an import process.
-- Reordering rows, inserting rows in the middle, deleting rows, or editing rows that are waiting for notification can make the saved row number state differ from the actual data.
-- Rows with an empty `名前` or `内容` value are treated as processed and skipped. If those cells are filled in later, the row will not be notified.
-- For workflows that require row edits after creation, consider adding a unique ID column and tracking notification state by ID instead of row number.
+- 初回実行時に既存の完成済み行は通知済みとして扱い、新規通知は次回以降に追加・更新された未通知行から始まります。
+- `通知ID` / `Discord通知済み` / `Gmail通知済み` / `通知スナップショット` はスクリプトが自動追加する管理列です。
+- 行を並べ替えたり途中に挿入したりしても、管理列が行と一緒に移動していれば通知状態は保たれます。
+- `名前` または `内容` が空の行は処理済みにせず、あとから値が入った時点で通知対象になります。
+- 通知が始まった行は `通知スナップショット` の内容で再試行されます。通知後に本文を編集しても再通知はされません。
+- 通知済み行をコピーすると `通知ID` の重複を検知し、コピー側には新しいIDを割り当てて通知対象にします。
 
 ## Setup
 
@@ -67,7 +70,7 @@ spreadsheet-update-notifier/
 | `ENABLE_DISCORD` | `true` | Discord通知を有効化 |
 | `ENABLE_EMAIL` | `true` | Gmail通知を有効化 |
 
-`DISCORD_WEBHOOK_URL` または `EMAIL_TO` が空でも、もう片方が設定されていれば通知は継続します。両方空の場合は通知先がないため、行番号は更新されません。
+`DISCORD_WEBHOOK_URL` または `EMAIL_TO` が空でも、もう片方が設定されていれば通知は継続します。両方空の場合は通知先がないため、通知処理は行われません。
 
 ## Trigger
 
@@ -82,23 +85,24 @@ Apps Script エディタで `installTimeDrivenTrigger()` を1回実行すると�
 
 ## How It Works
 
-1. `checkNewRows()` が `LockService` のロックを取得し、対象シートの最終行を取得します。
-2. `ScriptProperties` の `LAST_NOTIFIED_ROW` と比較します。
-3. 初回実行時は既存行を通知せず、現在の最終行を保存します。
-4. 2回目以降は `LAST_NOTIFIED_ROW` より下の行だけを読み取ります。
-5. `名前` または `内容` が空の行は通知対象外として処理済みにします。
-6. Discord / Gmail のどちらかだけ失敗した場合は、成功済みの宛先を `PENDING_NOTIFICATION_STATE` に保存します。
-7. 次回実行時は未送信の宛先だけ再試行し、必要な通知が完了した行まで `LAST_NOTIFIED_ROW` を更新します。
+1. `checkNewRows()` が `LockService` のロックを取得します。
+2. 管理列がなければ自動で追加します。
+3. 初回実行時は既存の完成済み行に `INITIAL_SYNC` を記録し、大量通知を防ぎます。
+4. 2回目以降は全データ行を読み取り、`通知ID` がない行にはIDを割り当てます。
+5. `名前` または `内容` が空の行は通知せず、次回以降もチェックします。
+6. 通知対象になった行は現在の内容を `通知スナップショット` に保存します。
+7. Discord / Gmail の成功状態をそれぞれの管理列に保存し、失敗した宛先だけ次回再試行します。
 
 ## Verification
 
-1. `checkNewRows()` を手動実行し、初回は通知されず `LAST_NOTIFIED_ROW` が保存されることを確認します。
+1. `checkNewRows()` を手動実行し、初回は通知されず管理列が追加されることを確認します。
 2. スプレッドシートに新しい行を追加します。
 3. `checkNewRows()` を再実行し、Discord と Gmail に通知が届くことを確認します。
 4. `DISCORD_WEBHOOK_URL` を空にして Gmail だけ届くことを確認します。
 5. `EMAIL_TO` を空にして Discord だけ届くことを確認します。
-6. `名前` または `内容` が空の行を追加し、通知されないことを確認します。
+6. `名前` または `内容` が空の行を追加し、あとから値を入れると通知されることを確認します。
 7. Discord または Gmail の片方を一時的に失敗させ、復旧後に未送信の宛先だけ再試行されることを確認します。
+8. 通知前の行を並べ替えたり途中に挿入したりしても、重複通知されないことを確認します。
 
 ## License
 

@@ -4,6 +4,7 @@ const PROPERTY_KEYS = {
   EMAIL_TO: 'EMAIL_TO',
   ENABLE_DISCORD: 'ENABLE_DISCORD',
   ENABLE_EMAIL: 'ENABLE_EMAIL',
+  NOTIFIER_INITIALIZED: 'NOTIFIER_INITIALIZED',
   LAST_NOTIFIED_ROW: 'LAST_NOTIFIED_ROW',
   PENDING_NOTIFICATION_STATE: 'PENDING_NOTIFICATION_STATE',
 };
@@ -13,17 +14,31 @@ const DEFAULTS = {
   ENABLE_DISCORD: true,
   ENABLE_EMAIL: true,
   DISCORD_USERNAME: 'Spreadsheet Notifier',
+  NOTIFICATION_ID_HEADER: '通知ID',
+  DISCORD_STATUS_HEADER: 'Discord通知済み',
+  EMAIL_STATUS_HEADER: 'Gmail通知済み',
+  SNAPSHOT_HEADER: '通知スナップショット',
 };
 
 const HEADER_ALIASES = {
   datetime: ['日時', 'タイムスタンプ', 'Timestamp', 'Date'],
   name: ['名前', 'Name'],
   content: ['内容', '本文', 'Message', 'Content'],
+  notificationId: ['通知ID', 'Notification ID'],
+  discordStatus: ['Discord通知済み', 'Discord Status'],
+  emailStatus: ['Gmail通知済み', 'Email Status'],
+  snapshot: ['通知スナップショット', 'Notification Snapshot'],
+};
+
+const STATUS_PREFIXES = {
+  SENT: 'SENT',
+  SKIPPED: 'SKIPPED',
+  INITIAL_SYNC: 'INITIAL_SYNC',
 };
 
 /**
  * Time-driven trigger entrypoint.
- * Checks for rows added after LAST_NOTIFIED_ROW and sends notifications.
+ * Scans rows by notification ID so row order changes do not cause duplicates.
  */
 function checkNewRows() {
   const lock = LockService.getScriptLock();
@@ -43,76 +58,25 @@ function checkNewRowsWithLock_() {
   const props = PropertiesService.getScriptProperties();
   const config = getConfig_(props);
   const sheet = getTargetSheet_(config.sheetName);
-  const lastRow = sheet.getLastRow();
+  const sheetContext = getSheetContext_(sheet);
+  const destinations = getDestinationDefinitions_(config);
+  const rows = getDataRows_(sheet, sheetContext.lastColumn);
 
-  if (lastRow < 2) {
-    props.setProperty(PROPERTY_KEYS.LAST_NOTIFIED_ROW, String(lastRow));
-    clearPendingDeliveryState_(props);
-    Logger.log('No data rows found. LAST_NOTIFIED_ROW was set to %s.', lastRow);
+  if (!isNotifierInitialized_(props)) {
+    initializeExistingRows_(sheet, rows, sheetContext.columnMap, destinations);
+    markNotifierInitialized_(props);
+    clearLegacyRowState_(props);
+    Logger.log('Initial sync completed. Existing complete rows were marked as already processed.');
     return;
   }
 
-  const storedLastRow = props.getProperty(PROPERTY_KEYS.LAST_NOTIFIED_ROW);
-  if (!storedLastRow) {
-    props.setProperty(PROPERTY_KEYS.LAST_NOTIFIED_ROW, String(lastRow));
-    clearPendingDeliveryState_(props);
-    Logger.log('First run detected. Existing rows were skipped up to row %s.', lastRow);
+  if (!hasDeliverableDestination_(destinations)) {
+    Logger.log('No notification destination is configured.');
     return;
   }
 
-  let lastNotifiedRow = Number(storedLastRow);
-  if (!Number.isFinite(lastNotifiedRow) || lastNotifiedRow < 1) {
-    lastNotifiedRow = 1;
-  }
-
-  if (lastNotifiedRow > lastRow) {
-    props.setProperty(PROPERTY_KEYS.LAST_NOTIFIED_ROW, String(lastRow));
-    clearPendingDeliveryState_(props);
-    Logger.log('Sheet has fewer rows than saved state. LAST_NOTIFIED_ROW was reset to %s.', lastRow);
-    return;
-  }
-
-  if (lastRow <= lastNotifiedRow) {
-    Logger.log('No new rows. lastRow=%s, LAST_NOTIFIED_ROW=%s', lastRow, lastNotifiedRow);
-    return;
-  }
-
-  const lastColumn = sheet.getLastColumn();
-  const headers = sheet.getRange(1, 1, 1, lastColumn).getValues()[0];
-  const columnMap = buildColumnMap_(headers);
-  const rowCount = lastRow - lastNotifiedRow;
-  const rows = sheet.getRange(lastNotifiedRow + 1, 1, rowCount, lastColumn).getValues();
-  let highestProcessedRow = lastNotifiedRow;
-
-  for (let index = 0; index < rows.length; index += 1) {
-    const rowNumber = lastNotifiedRow + index + 1;
-    const entry = buildEntry_(rows[index], columnMap, rowNumber, sheet.getName());
-
-    if (!isNotifiableEntry_(entry)) {
-      Logger.log('Skipped row %s because name or content is empty.', rowNumber);
-      clearPendingDeliveryState_(props);
-      highestProcessedRow = rowNumber;
-      continue;
-    }
-
-    const result = notifyEntry_(entry, config, props);
-    if (!result.hasDestination) {
-      Logger.log('Row %s was not delivered because no destination was available.', rowNumber);
-      break;
-    }
-
-    if (!result.complete) {
-      Logger.log('Row %s was partially delivered. Remaining destinations will be retried later.', rowNumber);
-      break;
-    }
-
-    highestProcessedRow = rowNumber;
-  }
-
-  if (highestProcessedRow > lastNotifiedRow) {
-    props.setProperty(PROPERTY_KEYS.LAST_NOTIFIED_ROW, String(highestProcessedRow));
-    Logger.log('LAST_NOTIFIED_ROW was updated to %s.', highestProcessedRow);
-  }
+  processRows_(sheet, rows, sheetContext.columnMap, destinations);
+  clearLegacyRowState_(props);
 }
 
 /**
@@ -134,13 +98,19 @@ function installTimeDrivenTrigger() {
 }
 
 /**
- * Clears saved delivery state.
- * The next checkNewRows run will initialize from the current last row.
+ * Clears saved setup state. Existing sheet status columns are not cleared.
+ */
+function resetNotificationState() {
+  const props = PropertiesService.getScriptProperties();
+  props.deleteProperty(PROPERTY_KEYS.NOTIFIER_INITIALIZED);
+  clearLegacyRowState_(props);
+}
+
+/**
+ * Backward-compatible alias for older README versions.
  */
 function resetLastNotifiedRow() {
-  const props = PropertiesService.getScriptProperties();
-  props.deleteProperty(PROPERTY_KEYS.LAST_NOTIFIED_ROW);
-  clearPendingDeliveryState_(props);
+  resetNotificationState();
 }
 
 function getConfig_(props) {
@@ -173,15 +143,48 @@ function getTargetSheet_(sheetName) {
   return sheet;
 }
 
-function buildColumnMap_(headers) {
+function getSheetContext_(sheet) {
+  const headerColumnCount = Math.max(sheet.getLastColumn(), 1);
+  const headers = sheet.getRange(1, 1, 1, headerColumnCount).getValues()[0];
+  const columnMap = {
+    datetime: findRequiredHeaderIndex_(headers, HEADER_ALIASES.datetime),
+    name: findRequiredHeaderIndex_(headers, HEADER_ALIASES.name),
+    content: findRequiredHeaderIndex_(headers, HEADER_ALIASES.content),
+  };
+
+  columnMap.notificationId = ensureHeader_(sheet, headers, HEADER_ALIASES.notificationId, DEFAULTS.NOTIFICATION_ID_HEADER);
+  columnMap.discordStatus = ensureHeader_(sheet, headers, HEADER_ALIASES.discordStatus, DEFAULTS.DISCORD_STATUS_HEADER);
+  columnMap.emailStatus = ensureHeader_(sheet, headers, HEADER_ALIASES.emailStatus, DEFAULTS.EMAIL_STATUS_HEADER);
+  columnMap.snapshot = ensureHeader_(sheet, headers, HEADER_ALIASES.snapshot, DEFAULTS.SNAPSHOT_HEADER);
+
   return {
-    datetime: findHeaderIndex_(headers, HEADER_ALIASES.datetime),
-    name: findHeaderIndex_(headers, HEADER_ALIASES.name),
-    content: findHeaderIndex_(headers, HEADER_ALIASES.content),
+    columnMap: columnMap,
+    lastColumn: headers.length,
   };
 }
 
-function findHeaderIndex_(headers, aliases) {
+function ensureHeader_(sheet, headers, aliases, defaultHeader) {
+  const existingIndex = findOptionalHeaderIndex_(headers, aliases);
+  if (existingIndex !== -1) {
+    return existingIndex;
+  }
+
+  const columnNumber = headers.length + 1;
+  sheet.getRange(1, columnNumber).setValue(defaultHeader);
+  headers.push(defaultHeader);
+  return headers.length - 1;
+}
+
+function findRequiredHeaderIndex_(headers, aliases) {
+  const index = findOptionalHeaderIndex_(headers, aliases);
+  if (index === -1) {
+    throw new Error('Required header was not found: ' + aliases[0]);
+  }
+
+  return index;
+}
+
+function findOptionalHeaderIndex_(headers, aliases) {
   const normalizedHeaders = headers.map(function (header) {
     return normalizeText_(header);
   });
@@ -194,13 +197,117 @@ function findHeaderIndex_(headers, aliases) {
     }
   }
 
-  throw new Error('Required header was not found: ' + aliases[0]);
+  return -1;
+}
+
+function getDataRows_(sheet, lastColumn) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) {
+    return [];
+  }
+
+  return sheet.getRange(2, 1, lastRow - 1, lastColumn).getValues();
+}
+
+function initializeExistingRows_(sheet, rows, columnMap, destinations) {
+  const seenIds = {};
+
+  for (let index = 0; index < rows.length; index += 1) {
+    const row = rows[index];
+    const rowNumber = index + 2;
+
+    if (!rowHasPublicInput_(row, columnMap)) {
+      continue;
+    }
+
+    ensureUniqueNotificationId_(sheet, row, rowNumber, columnMap, seenIds);
+    const entry = buildEntry_(row, columnMap, rowNumber, sheet.getName());
+
+    if (!isNotifiableEntry_(entry)) {
+      Logger.log('Initial sync left row %s pending because name or content is empty.', rowNumber);
+      continue;
+    }
+
+    markInitialSync_(sheet, row, rowNumber, columnMap, destinations);
+  }
+}
+
+function processRows_(sheet, rows, columnMap, destinations) {
+  const seenIds = {};
+
+  for (let index = 0; index < rows.length; index += 1) {
+    const row = rows[index];
+    const rowNumber = index + 2;
+
+    if (!rowHasPublicInput_(row, columnMap)) {
+      continue;
+    }
+
+    ensureUniqueNotificationId_(sheet, row, rowNumber, columnMap, seenIds);
+    const currentEntry = buildEntry_(row, columnMap, rowNumber, sheet.getName());
+
+    if (!isNotifiableEntry_(currentEntry)) {
+      Logger.log('Skipped row %s because name or content is empty. It will be checked again later.', rowNumber);
+      continue;
+    }
+
+    if (areAllDestinationStatusesComplete_(row, columnMap, destinations)) {
+      continue;
+    }
+
+    const notificationEntry = getOrCreateSnapshotEntry_(sheet, row, rowNumber, columnMap, currentEntry);
+    const result = notifyEntry_(sheet, row, rowNumber, columnMap, notificationEntry, destinations);
+
+    if (!result.complete) {
+      Logger.log('Row %s still has pending destinations and will be retried later.', rowNumber);
+      break;
+    }
+  }
+}
+
+function ensureUniqueNotificationId_(sheet, row, rowNumber, columnMap, seenIds) {
+  const idColumn = columnMap.notificationId;
+  let notificationId = cellToText_(row[idColumn]);
+
+  if (notificationId && !seenIds[notificationId]) {
+    seenIds[notificationId] = true;
+    return notificationId;
+  }
+
+  notificationId = createUniqueId_(seenIds);
+  writeCellValue_(sheet, row, rowNumber, idColumn, notificationId);
+  clearRowNotificationState_(sheet, row, rowNumber, columnMap);
+  return notificationId;
+}
+
+function createUniqueId_(seenIds) {
+  let notificationId = Utilities.getUuid();
+  while (seenIds[notificationId]) {
+    notificationId = Utilities.getUuid();
+  }
+
+  seenIds[notificationId] = true;
+  return notificationId;
+}
+
+function clearRowNotificationState_(sheet, row, rowNumber, columnMap) {
+  writeCellValue_(sheet, row, rowNumber, columnMap.discordStatus, '');
+  writeCellValue_(sheet, row, rowNumber, columnMap.emailStatus, '');
+  writeCellValue_(sheet, row, rowNumber, columnMap.snapshot, '');
+}
+
+function markInitialSync_(sheet, row, rowNumber, columnMap, destinations) {
+  for (let index = 0; index < destinations.length; index += 1) {
+    const destination = destinations[index];
+    writeDestinationStatus_(sheet, row, rowNumber, columnMap, destination, STATUS_PREFIXES.INITIAL_SYNC);
+  }
 }
 
 function buildEntry_(row, columnMap, rowNumber, sheetName) {
   const datetimeText = formatDateValue_(row[columnMap.datetime]) || formatDateValue_(new Date());
 
   return {
+    id: cellToText_(row[columnMap.notificationId]),
     rowNumber: rowNumber,
     sheetName: sheetName,
     datetime: datetimeText,
@@ -209,139 +316,160 @@ function buildEntry_(row, columnMap, rowNumber, sheetName) {
   };
 }
 
+function getOrCreateSnapshotEntry_(sheet, row, rowNumber, columnMap, currentEntry) {
+  const snapshotText = cellToText_(row[columnMap.snapshot]);
+  const snapshotEntry = parseSnapshotEntry_(snapshotText, currentEntry);
+
+  if (snapshotEntry) {
+    snapshotEntry.rowNumber = rowNumber;
+    snapshotEntry.sheetName = currentEntry.sheetName;
+    return snapshotEntry;
+  }
+
+  const snapshot = {
+    id: currentEntry.id,
+    datetime: currentEntry.datetime,
+    name: currentEntry.name,
+    content: currentEntry.content,
+  };
+  writeCellValue_(sheet, row, rowNumber, columnMap.snapshot, JSON.stringify(snapshot));
+  return currentEntry;
+}
+
+function parseSnapshotEntry_(snapshotText, currentEntry) {
+  if (!snapshotText) {
+    return null;
+  }
+
+  try {
+    const snapshot = JSON.parse(snapshotText);
+    if (snapshot.id !== currentEntry.id) {
+      return null;
+    }
+
+    return {
+      id: snapshot.id,
+      rowNumber: currentEntry.rowNumber,
+      sheetName: currentEntry.sheetName,
+      datetime: cellToText_(snapshot.datetime) || currentEntry.datetime,
+      name: cellToText_(snapshot.name) || currentEntry.name,
+      content: cellToText_(snapshot.content) || currentEntry.content,
+    };
+  } catch (error) {
+    Logger.log('Failed to parse notification snapshot for row %s: %s', currentEntry.rowNumber, error.message);
+    return null;
+  }
+}
+
 function isNotifiableEntry_(entry) {
   return entry.name !== '' && entry.content !== '';
 }
 
-function notifyEntry_(entry, config, props) {
-  const destinations = getActiveDestinations_(config);
-  if (destinations.length === 0) {
-    clearPendingDeliveryState_(props);
-    return {
-      hasDestination: false,
-      complete: false,
-    };
-  }
+function rowHasPublicInput_(row, columnMap) {
+  return (
+    cellToText_(row[columnMap.datetime]) !== '' ||
+    cellToText_(row[columnMap.name]) !== '' ||
+    cellToText_(row[columnMap.content]) !== ''
+  );
+}
 
-  const state = readPendingDeliveryState_(props, entry.rowNumber);
-  const failures = [];
+function notifyEntry_(sheet, row, rowNumber, columnMap, entry, destinations) {
+  let hasFailure = false;
 
   for (let index = 0; index < destinations.length; index += 1) {
     const destination = destinations[index];
-    if (state.delivered[destination.key]) {
+    const status = cellToText_(row[columnMap[destination.statusKey]]);
+
+    if (status) {
+      continue;
+    }
+
+    if (!destination.enabled || !destination.configured) {
+      writeDestinationStatus_(sheet, row, rowNumber, columnMap, destination, STATUS_PREFIXES.SKIPPED);
       continue;
     }
 
     try {
       destination.send(entry);
-      state.delivered[destination.key] = true;
-      savePendingDeliveryState_(props, entry.rowNumber, state.delivered);
+      writeDestinationStatus_(sheet, row, rowNumber, columnMap, destination, STATUS_PREFIXES.SENT);
     } catch (error) {
-      failures.push(destination.label + ': ' + error.message);
+      hasFailure = true;
+      Logger.log('%s notification failed for row %s: %s', destination.label, rowNumber, error.message);
     }
   }
 
-  if (failures.length > 0) {
-    Logger.log('Notification failures for row %s: %s', entry.rowNumber, failures.join(' / '));
-  }
-
-  if (isDeliveryComplete_(destinations, state.delivered)) {
-    clearPendingDeliveryState_(props);
-    return {
-      hasDestination: true,
-      complete: true,
-    };
-  }
-
-  savePendingDeliveryState_(props, entry.rowNumber, state.delivered);
   return {
-    hasDestination: true,
-    complete: false,
+    complete: !hasFailure && areAllDestinationStatusesComplete_(row, columnMap, destinations),
   };
 }
 
-function getActiveDestinations_(config) {
-  const destinations = [];
-
-  if (config.enableDiscord) {
-    if (config.discordWebhookUrl) {
-      destinations.push({
-        key: 'discord',
-        label: 'Discord',
-        send: function (entry) {
-          sendDiscordNotification_(entry, config.discordWebhookUrl);
-        },
-      });
-    } else {
-      Logger.log('Discord notification is enabled but DISCORD_WEBHOOK_URL is empty.');
-    }
-  }
-
-  if (config.enableEmail) {
-    if (config.emailTo) {
-      destinations.push({
-        key: 'email',
-        label: 'Email',
-        send: function (entry) {
-          sendEmailNotification_(entry, config.emailTo);
-        },
-      });
-    } else {
-      Logger.log('Email notification is enabled but EMAIL_TO is empty.');
-    }
-  }
-
-  return destinations;
+function getDestinationDefinitions_(config) {
+  return [
+    {
+      key: 'discord',
+      label: 'Discord',
+      statusKey: 'discordStatus',
+      enabled: config.enableDiscord,
+      configured: config.discordWebhookUrl !== '',
+      send: function (entry) {
+        sendDiscordNotification_(entry, config.discordWebhookUrl);
+      },
+    },
+    {
+      key: 'email',
+      label: 'Email',
+      statusKey: 'emailStatus',
+      enabled: config.enableEmail,
+      configured: config.emailTo !== '',
+      send: function (entry) {
+        sendEmailNotification_(entry, config.emailTo);
+      },
+    },
+  ];
 }
 
-function readPendingDeliveryState_(props, rowNumber) {
-  const emptyState = {
-    delivered: {},
-  };
-  const rawState = props.getProperty(PROPERTY_KEYS.PENDING_NOTIFICATION_STATE);
-
-  if (!rawState) {
-    return emptyState;
-  }
-
-  try {
-    const parsedState = JSON.parse(rawState);
-    if (parsedState.rowNumber !== rowNumber || !parsedState.delivered) {
-      return emptyState;
-    }
-
-    return {
-      delivered: parsedState.delivered,
-    };
-  } catch (error) {
-    Logger.log('Failed to parse pending delivery state: %s', error.message);
-    clearPendingDeliveryState_(props);
-    return emptyState;
-  }
-}
-
-function savePendingDeliveryState_(props, rowNumber, delivered) {
-  props.setProperty(
-    PROPERTY_KEYS.PENDING_NOTIFICATION_STATE,
-    JSON.stringify({
-      rowNumber: rowNumber,
-      delivered: delivered,
-    })
-  );
-}
-
-function clearPendingDeliveryState_(props) {
-  props.deleteProperty(PROPERTY_KEYS.PENDING_NOTIFICATION_STATE);
-}
-
-function isDeliveryComplete_(destinations, delivered) {
+function hasDeliverableDestination_(destinations) {
   for (let index = 0; index < destinations.length; index += 1) {
-    if (!delivered[destinations[index].key]) {
+    if (destinations[index].enabled && destinations[index].configured) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function areAllDestinationStatusesComplete_(row, columnMap, destinations) {
+  for (let index = 0; index < destinations.length; index += 1) {
+    const destination = destinations[index];
+    if (!cellToText_(row[columnMap[destination.statusKey]])) {
       return false;
     }
   }
 
   return true;
+}
+
+function writeDestinationStatus_(sheet, row, rowNumber, columnMap, destination, prefix) {
+  const status = prefix + ' ' + formatDateValue_(new Date());
+  writeCellValue_(sheet, row, rowNumber, columnMap[destination.statusKey], status);
+}
+
+function writeCellValue_(sheet, row, rowNumber, zeroBasedColumnIndex, value) {
+  sheet.getRange(rowNumber, zeroBasedColumnIndex + 1).setValue(value);
+  row[zeroBasedColumnIndex] = value;
+}
+
+function clearLegacyRowState_(props) {
+  props.deleteProperty(PROPERTY_KEYS.LAST_NOTIFIED_ROW);
+  props.deleteProperty(PROPERTY_KEYS.PENDING_NOTIFICATION_STATE);
+}
+
+function isNotifierInitialized_(props) {
+  return props.getProperty(PROPERTY_KEYS.NOTIFIER_INITIALIZED) === 'true';
+}
+
+function markNotifierInitialized_(props) {
+  props.setProperty(PROPERTY_KEYS.NOTIFIER_INITIALIZED, 'true');
 }
 
 function sendDiscordNotification_(entry, webhookUrl) {
@@ -369,7 +497,7 @@ function sendDiscordNotification_(entry, webhookUrl) {
           },
         ],
         footer: {
-          text: entry.sheetName + ' / row ' + entry.rowNumber,
+          text: entry.sheetName + ' / row ' + entry.rowNumber + ' / id ' + entry.id,
         },
         timestamp: new Date().toISOString(),
       },
@@ -410,6 +538,7 @@ function buildEmailBody_(entry) {
     '日時: ' + entry.datetime,
     'シート: ' + entry.sheetName,
     '行番号: ' + entry.rowNumber,
+    '通知ID: ' + entry.id,
   ].join('\n');
 }
 
