@@ -18,6 +18,7 @@ const DEFAULTS = {
   DISCORD_STATUS_HEADER: 'Discord通知済み',
   EMAIL_STATUS_HEADER: 'Gmail通知済み',
   SNAPSHOT_HEADER: '通知スナップショット',
+  PROTECTION_DESCRIPTION_PREFIX: 'Spreadsheet Notifier management column: ',
 };
 
 const HEADER_ALIASES = {
@@ -156,6 +157,7 @@ function getSheetContext_(sheet) {
   columnMap.discordStatus = ensureHeader_(sheet, headers, HEADER_ALIASES.discordStatus, DEFAULTS.DISCORD_STATUS_HEADER);
   columnMap.emailStatus = ensureHeader_(sheet, headers, HEADER_ALIASES.emailStatus, DEFAULTS.EMAIL_STATUS_HEADER);
   columnMap.snapshot = ensureHeader_(sheet, headers, HEADER_ALIASES.snapshot, DEFAULTS.SNAPSHOT_HEADER);
+  secureManagementColumns_(sheet, columnMap);
 
   return {
     columnMap: columnMap,
@@ -173,6 +175,119 @@ function ensureHeader_(sheet, headers, aliases, defaultHeader) {
   sheet.getRange(1, columnNumber).setValue(defaultHeader);
   headers.push(defaultHeader);
   return headers.length - 1;
+}
+
+function secureManagementColumns_(sheet, columnMap) {
+  const managementColumns = [
+    {
+      key: 'notificationId',
+      header: DEFAULTS.NOTIFICATION_ID_HEADER,
+    },
+    {
+      key: 'discordStatus',
+      header: DEFAULTS.DISCORD_STATUS_HEADER,
+    },
+    {
+      key: 'emailStatus',
+      header: DEFAULTS.EMAIL_STATUS_HEADER,
+    },
+    {
+      key: 'snapshot',
+      header: DEFAULTS.SNAPSHOT_HEADER,
+    },
+  ];
+
+  for (let index = 0; index < managementColumns.length; index += 1) {
+    const managementColumn = managementColumns[index];
+    const columnNumber = columnMap[managementColumn.key] + 1;
+    hideManagementColumn_(sheet, columnNumber, managementColumn.header);
+    protectManagementColumn_(sheet, columnNumber, managementColumn.header);
+  }
+}
+
+function hideManagementColumn_(sheet, columnNumber, header) {
+  try {
+    sheet.hideColumns(columnNumber);
+  } catch (error) {
+    Logger.log('Failed to hide management column %s: %s', header, error.message);
+  }
+}
+
+function protectManagementColumn_(sheet, columnNumber, header) {
+  try {
+    const description = DEFAULTS.PROTECTION_DESCRIPTION_PREFIX + header;
+    const protections = sheet.getProtections(SpreadsheetApp.ProtectionType.RANGE);
+
+    for (let index = 0; index < protections.length; index += 1) {
+      if (protections[index].getDescription() === description) {
+        if (isProtectionForColumn_(protections[index], columnNumber)) {
+          return;
+        }
+
+        protections[index].remove();
+        break;
+      }
+    }
+
+    const columnLetter = columnNumberToLetter_(columnNumber);
+    const protection = sheet.getRange(columnLetter + ':' + columnLetter)
+      .protect()
+      .setDescription(description);
+    protection.setWarningOnly(false);
+    keepOnlyCurrentUserAsProtectionEditor_(protection);
+  } catch (error) {
+    Logger.log('Failed to protect management column %s: %s', header, error.message);
+  }
+}
+
+function keepOnlyCurrentUserAsProtectionEditor_(protection) {
+  const currentUser = Session.getEffectiveUser();
+  const currentEmail = currentUser.getEmail();
+  protection.addEditor(currentUser);
+
+  if (!currentEmail) {
+    return;
+  }
+
+  const editors = protection.getEditors();
+  const editorsToRemove = [];
+
+  for (let index = 0; index < editors.length; index += 1) {
+    if (editors[index].getEmail() !== currentEmail) {
+      editorsToRemove.push(editors[index]);
+    }
+  }
+
+  if (editorsToRemove.length > 0) {
+    protection.removeEditors(editorsToRemove);
+  }
+
+  if (protection.canDomainEdit()) {
+    protection.setDomainEdit(false);
+  }
+}
+
+function isProtectionForColumn_(protection, columnNumber) {
+  try {
+    const range = protection.getRange();
+    return range.getColumn() === columnNumber && range.getNumColumns() === 1;
+  } catch (error) {
+    Logger.log('Failed to inspect existing protection range: %s', error.message);
+    return false;
+  }
+}
+
+function columnNumberToLetter_(columnNumber) {
+  let remaining = columnNumber;
+  let columnLetter = '';
+
+  while (remaining > 0) {
+    const modulo = (remaining - 1) % 26;
+    columnLetter = String.fromCharCode(65 + modulo) + columnLetter;
+    remaining = Math.floor((remaining - modulo) / 26);
+  }
+
+  return columnLetter;
 }
 
 function findRequiredHeaderIndex_(headers, aliases) {
