@@ -26,6 +26,9 @@ spreadsheet-update-notifier/
 ├── .gitignore
 ├── LICENSE
 ├── README.md
+├── docs/
+│   └── images/
+│       └── workflow-overview.svg
 ├── samples/
 │   └── sample-sheet.csv
 └── src/
@@ -42,6 +45,10 @@ spreadsheet-update-notifier/
 | 2026/05/13 09:00 | 山田太郎 | 問い合わせフォームから資料請求が届きました |
 
 サンプルデータは `samples/sample-sheet.csv` にあります。
+
+## Workflow Image
+
+![Spreadsheet update notification workflow](docs/images/workflow-overview.svg)
 
 ## Operational Notes
 
